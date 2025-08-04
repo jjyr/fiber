@@ -6000,3 +6000,104 @@ async fn test_funding_timeout() {
         .expect_event(|event| matches!(event, NetworkServiceEvent::ChannelFundingAborted(_)))
         .await;
 }
+
+#[tokio::test]
+async fn test_shutdown_channel_not_found_in_graph_channels() {
+    init_tracing();
+
+    let (node_a, node_b, channel_id, _) =
+        NetworkNode::new_2_nodes_with_established_channel(HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT, true)
+            .await;
+
+    let channel_outpoint = node_a.get_channel_outpoint(&channel_id).unwrap();
+
+    // Verify channel exists in graph_channels before shutdown
+    let node_a_channels_before = node_a.get_network_graph_channels().await;
+    let node_b_channels_before = node_b.get_network_graph_channels().await;
+
+    // Both nodes should see the channel in their network graph
+    assert!(node_a_channels_before
+        .iter()
+        .any(|c| c.channel_outpoint == channel_outpoint));
+    assert!(node_b_channels_before
+        .iter()
+        .any(|c| c.channel_outpoint == channel_outpoint));
+
+    // Make a transfer from node A to node B
+    let payment = node_a
+        .send_payment(SendPaymentCommand {
+            target_pubkey: Some(node_b.pubkey),
+            amount: Some(1000),
+            keysend: Some(true),
+            ..Default::default()
+        })
+        .await
+        .expect("send payment success");
+
+    // Send payment from node A to node B
+    // node_a.wait_until_success(payment.payment_hash).await;
+
+    // Perform cooperative shutdown
+    let message = |rpc_reply| -> NetworkActorMessage {
+        NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+            ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::Shutdown(
+                    ShutdownCommand {
+                        close_script: None,
+                        fee_rate: Some(FeeRate::from_u64(1000)),
+                        force: true,
+                    },
+                    rpc_reply,
+                ),
+            },
+        ))
+    };
+    call!(node_a.network_actor, message)
+        .expect("node_a alive")
+        .expect("shutdown success");
+
+    // Wait for shutdown to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+
+    // Verify channel state is closed
+    // wait_until(|| {
+    //     matches!(
+    //         node_a.get_channel_actor_state(channel_id).state,
+    //         ChannelState::Closed(..)
+    //     )
+    // })
+    // .await;
+    // wait_until(|| {
+    //     matches!(
+    //         node_b.get_channel_actor_state(channel_id).state,
+    //         ChannelState::Closed(..)
+    //     )
+    // })
+    // .await;
+    let node_a_state = node_a.get_channel_actor_state(channel_id);
+    let node_b_state = node_b.get_channel_actor_state(channel_id);
+
+    // assert_eq!(
+    //     node_a_state.state,
+    //     ChannelState::Closed(CloseFlags::UNCOOPERATIVE)
+    // );
+    // assert_eq!(
+    //     node_b_state.state,
+    //     ChannelState::Closed(CloseFlags::UNCOOPERATIVE)
+    // );
+
+    // Verify shutdown channel is not found in graph_channels
+    let node_a_channels_after = node_a.get_network_graph_channels().await;
+    let node_b_channels_after = node_b.get_network_graph_channels().await;
+    dbg!(&node_a_channels_after);
+    dbg!(&node_b_channels_after);
+
+    // The shutdown channel should not appear in graph_channels
+    assert!(!node_a_channels_after
+        .iter()
+        .any(|c| c.channel_outpoint == channel_outpoint));
+    // assert!(!node_b_channels_after
+    //     .iter()
+    //     .any(|c| c.channel_outpoint == channel_outpoint));
+}
