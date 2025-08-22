@@ -4666,6 +4666,10 @@ where
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        let now = std::time::Instant::now();
+        let msg_desc = format!("{:?}", &message);
+        debug!("begin_handle {}", &msg_desc);
+
         match message {
             NetworkActorMessage::Event(event) => {
                 if let Err(err) = self.handle_event(myself, state, event).await {
@@ -4683,6 +4687,8 @@ where
                 }
             }
         }
+
+        debug!("finish_handle {}ms {msg_desc}", now.elapsed().as_millis());
         Ok(())
     }
 
