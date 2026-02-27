@@ -252,3 +252,4 @@ CI runs the following checks (all must pass):
 - RPC API documentation: `crates/fiber-lib/src/rpc/README.md` (auto-generated)
 - Protocol specifications: `docs/specs/`
 - Development notes: `docs/notes/`
+- Design reference: `~/Workspace/lnd` (LND). When Fiber has unresolved design issues, study the corresponding LND mechanisms first and adapt them to Fiber/CKB constraints.
