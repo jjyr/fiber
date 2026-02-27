@@ -1565,40 +1565,41 @@ where
     ) {
         let payment_hash = state.payment_hash;
         if let Some(session) = self.store.get_payment_session(payment_hash) {
+            let session = session;
             if session.status.is_final() {
                 // Payment has reached final status, stop the actor
                 myself.stop(Some(format!(
                     "Payment complete with status {:?}",
                     session.status
                 )));
-            } else {
-                // Payment is still not final, log the current status for debugging
-                let active_attempts = session.active_attempts().count();
-                let inflight_attempts = session.attempts().filter(|a| a.is_inflight()).count();
-                let failed_attempts = session.attempts().filter(|a| a.is_failed()).count();
-                let total_attempts = session.attempts_count();
-
-                warn!(
-                    "Payment {:?} is still not final after periodic check, maybe the channel is down. \
-                    Status: {:?}, Active attempts: {}, Inflight: {}, Failed: {}, Total: {}, \
-                    Retry count: {}, Last error: {:?}",
-                    payment_hash,
-                    session.status,
-                    active_attempts,
-                    inflight_attempts,
-                    failed_attempts,
-                    total_attempts,
-                    state.retry_send_payment_count,
-                    session.last_error
-                );
-
-                // The tlc may stuck due to the channel is down
-                // we stop the actor, the actor will be resumed once tlc is processed
-                myself.stop(Some(
-                    "Payment is still not final, the tlc may stuck due to the channel is down"
-                        .to_string(),
-                ));
+                return;
             }
+
+            // Payment is still not final, log the current status for debugging
+            let active_attempts = session.active_attempts().count();
+            let inflight_attempts = session.attempts().filter(|a| a.is_inflight()).count();
+            let failed_attempts = session.attempts().filter(|a| a.is_failed()).count();
+            let total_attempts = session.attempts_count();
+            warn!(
+                "Payment {:?} is still not final after periodic check, maybe the channel is down. \
+                Status: {:?}, Active attempts: {}, Inflight: {}, Failed: {}, Total: {}, \
+                Retry count: {}, Last error: {:?}",
+                payment_hash,
+                session.status,
+                active_attempts,
+                inflight_attempts,
+                failed_attempts,
+                total_attempts,
+                state.retry_send_payment_count,
+                session.last_error
+            );
+
+            // The tlc may stuck due to the channel is down
+            // we stop the actor, the actor will be resumed once tlc is processed
+            myself.stop(Some(
+                "Payment is still not final, the tlc may stuck due to the channel is down"
+                    .to_string(),
+            ));
         } else {
             error!(
                 "Payment session not found during periodic check: {:?}",
@@ -2204,6 +2205,15 @@ where
             );
             return;
         };
+        let previous_status = attempt.status;
+        let attempt_id = attempt.id;
+        debug!(
+            "OnAddTlcResultEvent payment_hash={:?} attempt_id={:?} status_before={:?} result={:?}",
+            payment_hash,
+            attempt_id,
+            previous_status,
+            add_tlc_result
+        );
 
         match add_tlc_result {
             Ok(_) => {
@@ -2213,8 +2223,16 @@ where
                     .await
                     .track_attempt_router(&attempt);
                 self.store.insert_attempt(attempt);
+                debug!(
+                    "OnAddTlcResultEvent success moved attempt to inflight: payment_hash={:?} attempt_id={:?}",
+                    payment_hash, attempt_id
+                );
             }
             Err((ProcessingChannelError::WaitingTlcAck, _)) => {
+                debug!(
+                    "OnAddTlcResultEvent waiting tlc ack, keep attempt for payment_hash={:?} attempt_id={:?}",
+                    payment_hash, attempt_id
+                );
                 // do nothing
             }
             Err((error, tlc_err)) => {
@@ -2231,6 +2249,15 @@ where
                     Some(tlc_err.error_code),
                     &error.to_string(),
                     need_to_retry,
+                );
+                debug!(
+                    "OnAddTlcResultEvent failed attempt transition: payment_hash={:?} attempt_id={:?} status={:?}->{:?} error={:?} need_to_retry={}",
+                    payment_hash,
+                    attempt.id,
+                    previous_status,
+                    attempt.status,
+                    tlc_err.error_code,
+                    need_to_retry
                 );
 
                 if attempt.is_retrying() {
@@ -2257,8 +2284,17 @@ where
             );
             return;
         };
+        let previous_status = attempt.status;
+        let attempt_id = attempt.id;
+        debug!(
+            "OnRemoveTlcEvent payment_hash={:?} attempt_id={:?} status_before={:?} reason={:?}",
+            payment_hash,
+            attempt_id,
+            previous_status,
+            reason
+        );
 
-        match reason {
+        let new_status = match reason {
             RemoveTlcReason::RemoveTlcFulfill(fulfill) => {
                 self.network_graph
                     .write()
@@ -2277,6 +2313,7 @@ where
                             .clear_attempts_channel_index(session.payment_hash());
                     }
                 }
+                AttemptStatus::Success
             }
             RemoveTlcReason::RemoveTlcFail(reason) => {
                 let tlc_error = reason
@@ -2308,8 +2345,14 @@ where
                 if attempt.is_retrying() {
                     self.register_payment_retry(myself.clone(), state, Some(attempt.id));
                 }
+                attempt.status
             }
-        }
+        };
+
+        debug!(
+            "OnRemoveTlcEvent transition: payment_hash={:?} attempt_id={:?} status {:?}->{:?}",
+            payment_hash, attempt_id, previous_status, new_status
+        );
 
         #[cfg(debug_assertions)]
         {
