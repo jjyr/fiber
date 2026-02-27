@@ -851,9 +851,18 @@ where
                 );
 
                 // FIXME(yukang): need to make sure ChannelReady is sent after the channel is reestablished
-                state
+                let before = state.outpoint_channel_map.len();
+                let previous = state
                     .outpoint_channel_map
                     .insert(channel_outpoint.clone(), channel_id);
+                debug!(
+                    "outpoint_channel_map insert: outpoint {:?} -> {:?}, previous={:?}, map_len_before={}, map_len_after={}",
+                    channel_outpoint,
+                    channel_id,
+                    previous,
+                    before,
+                    state.outpoint_channel_map.len()
+                );
 
                 // Notify outside observers.
                 myself
@@ -2374,12 +2383,26 @@ where
         let info = peeled_onion_packet.current.clone();
         let shared_secret = peeled_onion_packet.shared_secret;
         let channel_outpoint = OutPoint::new(info.funding_tx_hash.into(), 0);
+        debug!(
+            "handle_send_onion_packet_command: payment_hash={:?} attempt_id={:?} amount={} expiry={} has_trampoline={}",
+            payment_hash,
+            attempt_id,
+            info.amount,
+            info.expiry,
+            peeled_onion_packet.current.trampoline_onion().is_some()
+        );
         let channel_id = match state.outpoint_channel_map.get(&channel_outpoint) {
             Some(channel_id) => channel_id,
             None => {
                 error!(
                     "Channel id not found in outpoint_channel_map with {:?}, are we connected to the peer?",
                      channel_outpoint
+                );
+                debug!(
+                    "outpoint_channel_map miss details: peer_public_key={:?}, map_size={}, active_channels={}",
+                    state.get_public_key(),
+                    state.outpoint_channel_map.len(),
+                    self.channels.len()
                 );
                 let tlc_err = TlcErr::new_channel_fail(
                     TlcErrorCode::UnknownNextPeer,
@@ -2408,20 +2431,28 @@ where
             },
             rpc_reply,
         );
-        trace!(
-            "Sending AddTlcCommand to {}, command {:?}",
+        debug!(
+            "handle_send_onion_packet_command: resolved channel {:?} for outpoint {:?}, payment_hash={:?} attempt_id={:?}",
             *channel_id,
-            command
+            channel_outpoint,
+            payment_hash,
+            attempt_id
         );
         // we have already checked the channel_id is valid,
         match state.send_command_to_channel(*channel_id, command).await {
             Ok(_) => {
+                debug!(
+                    "handle_send_onion_packet_command success: payment_hash={:?} attempt_id={:?} channel_id={:?}",
+                    payment_hash,
+                    attempt_id,
+                    channel_id
+                );
                 return Ok(());
             }
             Err(err) => {
                 error!(
                     "Failed to send onion packet to channel: {:?} with err: {:?}",
-                    channel_id, err
+                    payment_hash, err
                 );
                 let tlc_error = self.get_tlc_error(state, &err, &channel_outpoint);
                 return Err(tlc_error);
@@ -2586,6 +2617,16 @@ where
         }
     }
 
+    fn payment_actor_message_kind(message: &PaymentActorMessage) -> &'static str {
+        match message {
+            PaymentActorMessage::SendPayment(_, _) => "SendPayment",
+            PaymentActorMessage::RetrySendPayment(_) => "RetrySendPayment",
+            PaymentActorMessage::OnAddTlcResultEvent { .. } => "OnAddTlcResultEvent",
+            PaymentActorMessage::OnRemoveTlcEvent { .. } => "OnRemoveTlcEvent",
+            PaymentActorMessage::CheckPaymentStatus => "CheckPaymentStatus",
+        }
+    }
+
     async fn on_remove_tlc_event(
         &self,
         myself: ActorRef<NetworkActorMessage>,
@@ -2594,6 +2635,10 @@ where
         attempt_id: Option<u64>,
         reason: RemoveTlcReason,
     ) {
+        debug!(
+            "on_remove_tlc_event dispatch: payment_hash={:?} attempt_id={:?} reason={:?}",
+            payment_hash, attempt_id, reason
+        );
         self.resume_payment_actor_and_send_command(
             myself,
             state,
@@ -2622,12 +2667,26 @@ where
         add_tlc_result: Result<(Hash256, u64), (ProcessingChannelError, TlcErr)>,
         previous_tlc: Option<PrevTlcInfo>,
     ) {
+        let result_desc = match &add_tlc_result {
+            Ok((channel_id, tlc_id)) => {
+                format!("Ok(channel={:?}, tlc_id={})", channel_id, tlc_id)
+            }
+            Err((error, _)) => format!("Err({:?})", error),
+        };
+        debug!(
+            "on_add_tlc_result_event: payment_hash={:?} attempt_id={:?} previous_tlc={:?} result={}",
+            payment_hash, attempt_id, previous_tlc, result_desc
+        );
         if let Some(PrevTlcInfo {
             prev_channel_id: channel_id,
             prev_tlc_id: tlc_id,
             ..
         }) = previous_tlc
         {
+            debug!(
+                "on_add_tlc_result_event forwarding prev_tlc result: payment_hash={:?} prev_channel={:?} prev_tlc={}",
+                payment_hash, channel_id, tlc_id
+            );
             myself
                 .send_message(NetworkActorMessage::new_command(
                     NetworkActorCommand::ControlFiberChannel(ChannelCommandWithId {
@@ -2666,12 +2725,22 @@ where
         message: PaymentActorMessage,
     ) {
         if let Some(actor) = state.inflight_payments.get(&payment_hash) {
+            let message_kind = Self::payment_actor_message_kind(&message);
+            trace!(
+                "resume_payment_actor_and_send_command: reuse actor payment_hash={:?} message={}",
+                payment_hash, message_kind
+            );
             if let Err(err) = actor.send_message(message) {
                 debug!(
                             "PaymentActor message dropped because payment actor is likely stopping, error: {err}"
                         );
             }
         } else {
+            let message_kind = Self::payment_actor_message_kind(&message);
+            debug!(
+                "resume_payment_actor_and_send_command: missing actor for {:?}, will create and send message={}",
+                payment_hash, message_kind
+            );
             debug!(
                 "Can't find inflight payment actor for {payment_hash:?}, start a new payment actor"
             );
@@ -2692,6 +2761,12 @@ where
         payment_hash: Hash256,
         init_command: PaymentActorMessage,
     ) -> Result<(), String> {
+        let init_command_kind = Self::payment_actor_message_kind(&init_command);
+        debug!(
+            "start_payment_actor: payment_hash={:?}, init_command={}",
+            payment_hash,
+            init_command_kind
+        );
         if state.inflight_payments.contains_key(&payment_hash) {
             error!("Already had a payment actor with the same hash {payment_hash:?}");
 
@@ -2726,7 +2801,11 @@ where
         .await
         {
             Ok((actor, _handle)) => {
-                debug!("Payment actor start {payment_hash}");
+                debug!(
+                    "Payment actor started successfully: payment_hash={:?}, init_command={}",
+                    payment_hash,
+                    init_command_kind
+                );
                 state.inflight_payments.insert(payment_hash, actor);
                 Ok(())
             }
@@ -3608,11 +3687,20 @@ where
         channel_id: Hash256,
         command: ChannelCommand,
     ) -> crate::Result<()> {
+        let command_name = command.to_string();
+        debug!(
+            "send_command_to_channel start: channel_id={:?}, command={}",
+            channel_id, command_name
+        );
         match command {
             // Need to handle the force shutdown command specially because the ChannelActor
             // may not exist when remote peer is disconnected.
             ChannelCommand::Shutdown(shutdown, rpc_reply) if shutdown.force => {
                 if let Some(actor) = self.channels.get(&channel_id) {
+                    debug!(
+                        "send_command_to_channel force shutdown dispatch to running actor for channel {:?}",
+                        channel_id
+                    );
                     actor.send_message(ChannelActorMessage::Command(ChannelCommand::Shutdown(
                         shutdown, rpc_reply,
                     )))?;
@@ -3675,10 +3763,20 @@ where
             }
             _ => match self.channels.get(&channel_id) {
                 Some(actor) => {
+                    debug!(
+                        "send_command_to_channel dispatch command={} to running actor for channel {:?}",
+                        command_name,
+                        channel_id
+                    );
                     actor.send_message(ChannelActorMessage::Command(command))?;
                     Ok(())
                 }
                 None => {
+                    debug!(
+                        "send_command_to_channel no running channel actor for {:?}, stored_state={}",
+                        channel_id,
+                        self.store.get_channel_actor_state(&channel_id).is_some()
+                    );
                     // if it's relay remove tlc, insert it into ChannelActorState's retryable queue
                     if let ChannelCommand::RemoveTlc(remove_tlc, _) = &command {
                         if let Some(mut state) = self.store.get_channel_actor_state(&channel_id) {
@@ -3711,10 +3809,33 @@ where
                                     remove_tlc.reason.clone(),
                                 );
                                 if !state.retryable_tlc_operations.contains(&operation) {
+                                    debug!(
+                                        "send_command_to_channel queue retryable remove for missing channel {:?}: tlc_id={}",
+                                        channel_id,
+                                        remove_tlc.id
+                                    );
                                     state.retryable_tlc_operations.push_back(operation);
+                                } else {
+                                    debug!(
+                                        "send_command_to_channel duplicate retryable remove ignored for missing channel {:?}: tlc_id={}",
+                                        channel_id,
+                                        remove_tlc.id
+                                    );
                                 }
                                 self.store.insert_channel_actor_state(state);
+                            } else {
+                                debug!(
+                                    "send_command_to_channel missing channel state for command={} channel={:?}",
+                                    command_name,
+                                    channel_id
+                                );
                             }
+                        } else {
+                            debug!(
+                                "send_command_to_channel command={} missing running channel {:?}",
+                                command_name,
+                                channel_id
+                            );
                         }
                     }
 
@@ -4036,7 +4157,19 @@ where
         {
             self.pending_channels.remove(outpoint);
         }
+        let before = self.outpoint_channel_map.len();
+        let matched_before = self
+            .outpoint_channel_map
+            .iter()
+            .any(|(_, id)| *id == &channel_id);
         self.outpoint_channel_map.retain(|_, id| *id != channel_id);
+        debug!(
+            "outpoint_channel_map cleanup on stop channel: channel={} matched_outpoint_exists={} map_len_before={} map_len_after={}",
+            channel_id,
+            matched_before,
+            before,
+            self.outpoint_channel_map.len()
+        );
     }
 
     pub async fn on_init_msg(

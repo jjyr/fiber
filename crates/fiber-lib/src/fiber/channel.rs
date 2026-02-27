@@ -2083,6 +2083,10 @@ where
             if state.is_waiting_tlc_ack() {
                 state.log_ack_state("[ack] retryable_ops_blocked");
                 debug!(
+                    "apply_retryable_tlc_operations blocked: channel={} waiting_tlc_ack=true reestablishing={}",
+                    self.get_id(),
+                    state.reestablishing
+                );
                     "apply_retryable_tlc_operations blocked remained_ops={}",
                     state.retryable_tlc_operations.len()
                 );
@@ -6414,6 +6418,20 @@ impl ChannelActorState {
         );
 
         if is_tlc_command_message && (self.is_waiting_tlc_ack() || self.reestablishing) {
+            let blocker = if self.is_waiting_tlc_ack() {
+                "waiting_tlc_ack"
+            } else {
+                "reestablishing"
+            };
+            self.log_ack_state("[ack] check_for_tlc_update_blocked");
+            debug!(
+                "check_for_tlc_update blocked: channel={} action={:?} blocker={} reestablishing={:?} state={:?}",
+                self.get_id(),
+                action,
+                blocker,
+                self.reestablishing,
+                self.state,
+            );
             return Err(ProcessingChannelError::WaitingTlcAck);
         }
 
@@ -7407,13 +7425,34 @@ impl ChannelActorState {
                 {
                     // commitments are the same, sync up the tlcs
                     self.set_waiting_ack(myself, false);
+                    debug!(
+                        "reestablish branch same commitments: clear waiting_ack and resend tlcs on {} (local {}:{}, remote {}:{})",
+                        self.get_id(),
+                        my_local_commitment_number,
+                        my_remote_commitment_number,
+                        peer_local_commitment_number,
+                        peer_remote_commitment_number
+                    );
                     self.resend_tlcs_on_reestablish(true)?;
                 } else if my_remote_commitment_number == peer_local_commitment_number + 1 {
                     // peer need ACK, I need to resend my revoke_and_ack message
                     // don't clear my waiting_ack flag here, since if i'm waiting for peer ack,
                     // peer will resend commitment_signed message
+                    debug!(
+                        "reestablish branch peer ahead by one: local_ack={} local_cn {}:{} peer_cn {}:{}",
+                        my_waiting_ack,
+                        my_local_commitment_number,
+                        my_remote_commitment_number,
+                        peer_local_commitment_number,
+                        peer_remote_commitment_number
+                    );
                     if my_waiting_ack && my_local_commitment_number == peer_remote_commitment_number
                     {
+                        debug!(
+                            "reestablish branch dual replay path possible: my_waiting_ack={} has_commit_diff={}",
+                            my_waiting_ack,
+                            pending_commit_diff.is_some()
+                        );
                         if let Some(ref commit_diff) = pending_commit_diff {
                             // === New path: deterministic replay from stored CommitDiff ===
                             self.validate_commit_diff_for_replay(reestablish_channel, commit_diff)?;
@@ -7459,12 +7498,19 @@ impl ChannelActorState {
                             self.resend_tlcs_on_reestablish(true)?;
                         }
                     } else {
+                        debug!(
+                            "reestablish branch peer ahead without local waiting_ack; only resend revoke_and_ack"
+                        );
                         self.send_revoke_and_ack_message(true)?;
                     }
                 } else if my_waiting_ack
                     && my_local_commitment_number == peer_remote_commitment_number
                 {
                     // I need to resend my commitment_signed message, don't clear my WaitingTlcAck flag.
+                    debug!(
+                        "reestablish branch keep waiting_ack and resend commitment on {}",
+                        self.get_id()
+                    );
                     if let Some(ref commit_diff) = pending_commit_diff {
                         // === New path: deterministic replay from stored CommitDiff ===
                         self.validate_commit_diff_for_replay(reestablish_channel, commit_diff)?;
@@ -7480,8 +7526,21 @@ impl ChannelActorState {
                     }
                 } else {
                     // ignore, waiting for remote peer to resend revoke_and_ack
+                    debug!(
+                        "reestablish branch waiting for peer revoke_and_ack on {}",
+                        self.get_id()
+                    );
                 }
 
+                self.log_ack_state("[ack] handle_reestablish_channel_message_ready_exit");
+                debug!(
+                    "reestablish ready branch exit for channel={} waiting_ack={} retryable_ops={} deferred_peer_tlc_updates={} defer_peer_updates={}",
+                    self.get_id(),
+                    self.tlc_state.waiting_ack,
+                    self.retryable_tlc_operations.len(),
+                    self.deferred_peer_tlc_updates.len(),
+                    self.defer_peer_tlc_updates
+                );
                 self.on_reestablished_channel_ready(myself);
                 debug_event!(network, "Reestablished channel in ChannelReady");
             }
