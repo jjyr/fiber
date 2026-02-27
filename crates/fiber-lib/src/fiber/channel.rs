@@ -2080,18 +2080,19 @@ where
         );
         state.log_ack_state("[ack] retryable_ops_start");
         loop {
-            if state.is_waiting_tlc_ack() {
-                state.log_ack_state("[ack] retryable_ops_blocked");
-                debug!(
-                    "apply_retryable_tlc_operations blocked: channel={} waiting_tlc_ack=true reestablishing={}",
-                    self.get_id(),
-                    state.reestablishing
-                );
+                if state.is_waiting_tlc_ack() {
+                    state.log_ack_state("[ack] retryable_ops_blocked");
+                    debug!(
+                        "apply_retryable_tlc_operations blocked: channel={} waiting_tlc_ack=true reestablishing={}",
+                        state.get_id(),
+                        state.reestablishing
+                    );
+                    debug!(
                     "apply_retryable_tlc_operations blocked remained_ops={}",
                     state.retryable_tlc_operations.len()
-                );
-                break;
-            }
+                    );
+                    break;
+                }
 
             let Some(operation) = state.retryable_tlc_operations.pop_front() else {
                 debug!("apply_retryable_tlc_operations empty queue, exiting",);

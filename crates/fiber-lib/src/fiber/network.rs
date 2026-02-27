@@ -2402,7 +2402,7 @@ where
                     "outpoint_channel_map miss details: peer_public_key={:?}, map_size={}, active_channels={}",
                     state.get_public_key(),
                     state.outpoint_channel_map.len(),
-                    self.channels.len()
+                    state.channels.len()
                 );
                 let tlc_err = TlcErr::new_channel_fail(
                     TlcErrorCode::UnknownNextPeer,
@@ -4161,7 +4161,7 @@ where
         let matched_before = self
             .outpoint_channel_map
             .iter()
-            .any(|(_, id)| *id == &channel_id);
+            .any(|(_, id)| *id == channel_id);
         self.outpoint_channel_map.retain(|_, id| *id != channel_id);
         debug!(
             "outpoint_channel_map cleanup on stop channel: channel={} matched_outpoint_exists={} map_len_before={} map_len_after={}",
