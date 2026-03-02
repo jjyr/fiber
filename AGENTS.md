@@ -2,6 +2,11 @@
 
 This document provides essential guidelines for AI coding agents working on the Fiber Network Node codebase. The Fiber Network is a reference implementation of a peer-to-peer payment/swap network built on CKB blockchain, similar to Lightning Network.
 
+## Debug Collaboration Rule
+
+- 当前阶段 focus 在定位问题与证据收集（trace / log / 根因链路），不要直接改业务修复逻辑。
+- 只有当用户明确确认修复方案后，才进入修复实现与回归阶段。
+
 ## Build System & Commands
 
 ### Primary Language & Toolchain

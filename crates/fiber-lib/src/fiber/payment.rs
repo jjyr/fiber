@@ -2209,10 +2209,7 @@ where
         let attempt_id = attempt.id;
         debug!(
             "OnAddTlcResultEvent payment_hash={:?} attempt_id={:?} status_before={:?} result={:?}",
-            payment_hash,
-            attempt_id,
-            previous_status,
-            add_tlc_result
+            payment_hash, attempt_id, previous_status, add_tlc_result
         );
 
         match add_tlc_result {
@@ -2288,10 +2285,7 @@ where
         let attempt_id = attempt.id;
         debug!(
             "OnRemoveTlcEvent payment_hash={:?} attempt_id={:?} status_before={:?} reason={:?}",
-            payment_hash,
-            attempt_id,
-            previous_status,
-            reason
+            payment_hash, attempt_id, previous_status, reason
         );
 
         let new_status = match reason {

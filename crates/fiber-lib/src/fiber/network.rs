@@ -2392,24 +2392,34 @@ where
             peeled_onion_packet.current.trampoline_onion().is_some()
         );
         let channel_id = match state.outpoint_channel_map.get(&channel_outpoint) {
-            Some(channel_id) => channel_id,
+            Some(channel_id) => *channel_id,
             None => {
+                let has_active_channel =
+                    self.has_active_channel_in_store_for_outpoint(state, &channel_outpoint);
                 error!(
                     "Channel id not found in outpoint_channel_map with {:?}, are we connected to the peer?",
                      channel_outpoint
                 );
                 debug!(
-                    "outpoint_channel_map miss details: peer_public_key={:?}, map_size={}, active_channels={}",
+                    "outpoint_channel_map miss details: peer_public_key={:?}, map_size={}, active_channels={}, has_active_channel_in_store={}",
                     state.get_public_key(),
                     state.outpoint_channel_map.len(),
-                    state.channels.len()
+                    state.channels.len(),
+                    has_active_channel
                 );
-                let tlc_err = TlcErr::new_channel_fail(
-                    TlcErrorCode::UnknownNextPeer,
-                    state.get_public_key(),
-                    channel_outpoint.clone(),
-                    None,
-                );
+                let tlc_err = if has_active_channel {
+                    TlcErr::new_node_fail(
+                        TlcErrorCode::TemporaryNodeFailure,
+                        state.get_public_key(),
+                    )
+                } else {
+                    TlcErr::new_channel_fail(
+                        TlcErrorCode::UnknownNextPeer,
+                        state.get_public_key(),
+                        channel_outpoint.clone(),
+                        None,
+                    )
+                };
                 return Err(tlc_err);
             }
         };
@@ -2433,13 +2443,13 @@ where
         );
         debug!(
             "handle_send_onion_packet_command: resolved channel {:?} for outpoint {:?}, payment_hash={:?} attempt_id={:?}",
-            *channel_id,
+            channel_id,
             channel_outpoint,
             payment_hash,
             attempt_id
         );
         // we have already checked the channel_id is valid,
-        match state.send_command_to_channel(*channel_id, command).await {
+        match state.send_command_to_channel(channel_id, command).await {
             Ok(_) => {
                 debug!(
                     "handle_send_onion_packet_command success: payment_hash={:?} attempt_id={:?} channel_id={:?}",
@@ -2594,13 +2604,21 @@ where
         channel_outpoint: &OutPoint,
     ) -> TlcErr {
         let node_id = state.get_public_key();
+        let has_active_channel =
+            self.has_active_channel_in_store_for_outpoint(state, channel_outpoint);
         match error {
-            Error::ChannelNotFound(_) | Error::PeerNotFound(_) => TlcErr::new_channel_fail(
-                TlcErrorCode::UnknownNextPeer,
-                node_id,
-                channel_outpoint.clone(),
-                None,
-            ),
+            Error::ChannelNotFound(_) | Error::PeerNotFound(_) => {
+                if has_active_channel {
+                    TlcErr::new_node_fail(TlcErrorCode::TemporaryNodeFailure, node_id)
+                } else {
+                    TlcErr::new_channel_fail(
+                        TlcErrorCode::UnknownNextPeer,
+                        node_id,
+                        channel_outpoint.clone(),
+                        None,
+                    )
+                }
+            }
             Error::ChannelError(_) => TlcErr::new_channel_fail(
                 TlcErrorCode::TemporaryChannelFailure,
                 node_id,
@@ -2615,6 +2633,17 @@ where
                 TlcErr::new_node_fail(TlcErrorCode::TemporaryNodeFailure, state.get_public_key())
             }
         }
+    }
+
+    fn has_active_channel_in_store_for_outpoint(
+        &self,
+        state: &NetworkActorState<S, C>,
+        channel_outpoint: &OutPoint,
+    ) -> bool {
+        state
+            .store
+            .get_channel_state_by_outpoint(channel_outpoint)
+            .is_some_and(|channel_state| !channel_state.is_closed())
     }
 
     fn payment_actor_message_kind(message: &PaymentActorMessage) -> &'static str {
@@ -2728,7 +2757,8 @@ where
             let message_kind = Self::payment_actor_message_kind(&message);
             trace!(
                 "resume_payment_actor_and_send_command: reuse actor payment_hash={:?} message={}",
-                payment_hash, message_kind
+                payment_hash,
+                message_kind
             );
             if let Err(err) = actor.send_message(message) {
                 debug!(
@@ -2764,8 +2794,7 @@ where
         let init_command_kind = Self::payment_actor_message_kind(&init_command);
         debug!(
             "start_payment_actor: payment_hash={:?}, init_command={}",
-            payment_hash,
-            init_command_kind
+            payment_hash, init_command_kind
         );
         if state.inflight_payments.contains_key(&payment_hash) {
             error!("Already had a payment actor with the same hash {payment_hash:?}");
@@ -2803,8 +2832,7 @@ where
             Ok((actor, _handle)) => {
                 debug!(
                     "Payment actor started successfully: payment_hash={:?}, init_command={}",
-                    payment_hash,
-                    init_command_kind
+                    payment_hash, init_command_kind
                 );
                 state.inflight_payments.insert(payment_hash, actor);
                 Ok(())
@@ -3779,25 +3807,40 @@ where
                     );
                     // if it's relay remove tlc, insert it into ChannelActorState's retryable queue
                     if let ChannelCommand::RemoveTlc(remove_tlc, _) = &command {
+                        let remove_tlc_id = TLCId::Received(remove_tlc.id);
                         if let Some(mut state) = self.store.get_channel_actor_state(&channel_id) {
+                            let tlc_snapshot = state.tlc_state.get(&remove_tlc_id);
+                            debug!(
+                                "send_command_to_channel missing-actor remove context: channel_id={:?} tlc_id={:?} payment_hash={:?} reason={:?} channel_state={:?} retry_queue_len={} reestablishing={} tlc_exists={} tlc_status={:?} tlc_removed_reason={:?} forwarding_tlc={:?} attempt_id={:?}",
+                                channel_id,
+                                remove_tlc_id,
+                                tlc_snapshot.map(|tlc| tlc.payment_hash),
+                                remove_tlc.reason,
+                                state.state,
+                                state.retryable_tlc_operations.len(),
+                                state.reestablishing,
+                                tlc_snapshot.is_some(),
+                                tlc_snapshot.map(|tlc| tlc.status.clone()),
+                                tlc_snapshot.and_then(|tlc| tlc.removed_reason.clone()),
+                                tlc_snapshot.and_then(|tlc| tlc.forwarding_tlc),
+                                tlc_snapshot.and_then(|tlc| tlc.attempt_id),
+                            );
                             if matches!(
                                 state.state,
                                 ChannelState::ChannelReady | ChannelState::ShuttingDown(_)
                             ) {
                                 if let RemoveTlcReason::RemoveTlcFulfill(RemoveTlcFulfill {
                                     payment_preimage,
-                                }) = remove_tlc.reason
+                                }) = &remove_tlc.reason
                                 {
-                                    if let Some(tlc) =
-                                        state.tlc_state.get(&TLCId::Received(remove_tlc.id))
-                                    {
+                                    if let Some(tlc) = state.tlc_state.get(&remove_tlc_id) {
                                         let payment_hash = tlc.payment_hash;
-                                        self.store.insert_preimage(payment_hash, payment_preimage);
+                                        self.store.insert_preimage(payment_hash, *payment_preimage);
                                         self.network
                                             .send_message(NetworkActorMessage::new_notification(
                                                 NetworkServiceEvent::PreimageCreated(
                                                     payment_hash,
-                                                    payment_preimage,
+                                                    *payment_preimage,
                                                 ),
                                             ))
                                             .expect(ASSUME_NETWORK_ACTOR_ALIVE);
@@ -3805,36 +3848,48 @@ where
                                 }
 
                                 let operation = RetryableTlcOperation::RemoveTlc(
-                                    TLCId::Received(remove_tlc.id),
+                                    remove_tlc_id,
                                     remove_tlc.reason.clone(),
                                 );
+                                let queue_len_before = state.retryable_tlc_operations.len();
                                 if !state.retryable_tlc_operations.contains(&operation) {
-                                    debug!(
-                                        "send_command_to_channel queue retryable remove for missing channel {:?}: tlc_id={}",
-                                        channel_id,
-                                        remove_tlc.id
-                                    );
                                     state.retryable_tlc_operations.push_back(operation);
+                                    debug!(
+                                        "send_command_to_channel queued retryable remove for missing actor: channel_id={:?} tlc_id={:?} payment_hash={:?} reason={:?} queue_len_before={} queue_len_after={}",
+                                        channel_id,
+                                        remove_tlc_id,
+                                        tlc_snapshot.map(|tlc| tlc.payment_hash),
+                                        remove_tlc.reason,
+                                        queue_len_before,
+                                        state.retryable_tlc_operations.len()
+                                    );
                                 } else {
                                     debug!(
-                                        "send_command_to_channel duplicate retryable remove ignored for missing channel {:?}: tlc_id={}",
+                                        "send_command_to_channel duplicate retryable remove ignored for missing actor: channel_id={:?} tlc_id={:?} payment_hash={:?} reason={:?} queue_len={}",
                                         channel_id,
-                                        remove_tlc.id
+                                        remove_tlc_id,
+                                        tlc_snapshot.map(|tlc| tlc.payment_hash),
+                                        remove_tlc.reason,
+                                        state.retryable_tlc_operations.len()
                                     );
                                 }
                                 self.store.insert_channel_actor_state(state);
                             } else {
                                 debug!(
-                                    "send_command_to_channel missing channel state for command={} channel={:?}",
+                                    "send_command_to_channel missing-actor remove ignored due to channel state: command={} channel_id={:?} tlc_id={:?} channel_state={:?}",
                                     command_name,
-                                    channel_id
+                                    channel_id,
+                                    remove_tlc_id,
+                                    state.state
                                 );
                             }
                         } else {
                             debug!(
-                                "send_command_to_channel command={} missing running channel {:?}",
+                                "send_command_to_channel missing-actor remove has no persisted state: command={} channel_id={:?} tlc_id={:?} reason={:?}",
                                 command_name,
-                                channel_id
+                                channel_id,
+                                remove_tlc_id,
+                                remove_tlc.reason
                             );
                         }
                     }

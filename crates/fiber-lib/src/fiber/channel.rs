@@ -2080,24 +2080,52 @@ where
         );
         state.log_ack_state("[ack] retryable_ops_start");
         loop {
-                if state.is_waiting_tlc_ack() {
-                    state.log_ack_state("[ack] retryable_ops_blocked");
-                    debug!(
+            if state.is_waiting_tlc_ack() {
+                state.log_ack_state("[ack] retryable_ops_blocked");
+                debug!(
                         "apply_retryable_tlc_operations blocked: channel={} waiting_tlc_ack=true reestablishing={}",
                         state.get_id(),
                         state.reestablishing
                     );
-                    debug!(
+                debug!(
                     "apply_retryable_tlc_operations blocked remained_ops={}",
                     state.retryable_tlc_operations.len()
-                    );
-                    break;
-                }
+                );
+                break;
+            }
 
             let Some(operation) = state.retryable_tlc_operations.pop_front() else {
                 debug!("apply_retryable_tlc_operations empty queue, exiting",);
                 return;
             };
+
+            let operation_summary = match &operation {
+                RetryableTlcOperation::RemoveTlc(tlc_id, reason) => {
+                    let tlc_snapshot = state.tlc_state.get(tlc_id);
+                    format!(
+                        "RemoveTlc tlc_id={:?} reason={:?} payment_hash={:?} attempt_id={:?} forwarding_tlc={:?} tlc_status={:?} tlc_removed_reason={:?}",
+                        tlc_id,
+                        reason,
+                        tlc_snapshot.map(|tlc| tlc.payment_hash),
+                        tlc_snapshot.and_then(|tlc| tlc.attempt_id),
+                        tlc_snapshot.and_then(|tlc| tlc.forwarding_tlc),
+                        tlc_snapshot.map(|tlc| tlc.status.clone()),
+                        tlc_snapshot.and_then(|tlc| tlc.removed_reason.clone())
+                    )
+                }
+                RetryableTlcOperation::AddTlc(command) => format!(
+                    "AddTlc payment_hash={:?} attempt_id={:?} previous_tlc={:?}",
+                    command.payment_hash, command.attempt_id, command.previous_tlc
+                ),
+            };
+            debug!(
+                "apply_retryable_tlc_operations pop op: channel={} op={} remained_ops={} waiting_tlc_ack={} reestablishing={}",
+                state.get_id(),
+                operation_summary,
+                state.retryable_tlc_operations.len(),
+                state.is_waiting_tlc_ack(),
+                state.reestablishing
+            );
 
             #[cfg(debug_assertions)]
             {
@@ -2130,8 +2158,24 @@ where
             };
 
             if success {
+                debug!(
+                    "apply_retryable_tlc_operations op succeeded: channel={} op={} remained_ops={} waiting_tlc_ack={} reestablishing={}",
+                    state.get_id(),
+                    operation_summary,
+                    state.retryable_tlc_operations.len(),
+                    state.is_waiting_tlc_ack(),
+                    state.reestablishing
+                );
                 break;
             }
+            debug!(
+                "apply_retryable_tlc_operations op failed: channel={} op={} remained_ops={} waiting_tlc_ack={} reestablishing={}",
+                state.get_id(),
+                operation_summary,
+                state.retryable_tlc_operations.len(),
+                state.is_waiting_tlc_ack(),
+                state.reestablishing
+            );
         }
 
         if trigger_next {
@@ -2151,12 +2195,35 @@ where
         state: &mut ChannelActorState,
         result: ForwardTlcResult,
     ) {
-        let Some(shared_secret) = state
-            .waiting_forward_tlc_tasks
-            .remove(&TLCId::Received(result.tlc_id))
-        else {
+        let waiting_tlc_id = TLCId::Received(result.tlc_id);
+        let waiting_len_before = state.waiting_forward_tlc_tasks.len();
+        let add_tlc_result_ok = result.add_tlc_result.is_ok();
+        let Some(shared_secret) = state.waiting_forward_tlc_tasks.remove(&waiting_tlc_id) else {
+            let tlc_snapshot = state.tlc_state.get(&waiting_tlc_id);
+            warn!(
+                "handle_forward_tlc_result waiting map miss: channel={} payment_hash={:?} tlc_id={:?} add_tlc_result_ok={} waiting_len_before={} tlc_exists={} tlc_status={:?} tlc_removed_reason={:?} forwarding_tlc={:?} attempt_id={:?}",
+                state.get_id(),
+                result.payment_hash,
+                waiting_tlc_id,
+                add_tlc_result_ok,
+                waiting_len_before,
+                tlc_snapshot.is_some(),
+                tlc_snapshot.map(|tlc| tlc.status.clone()),
+                tlc_snapshot.and_then(|tlc| tlc.removed_reason.clone()),
+                tlc_snapshot.and_then(|tlc| tlc.forwarding_tlc),
+                tlc_snapshot.and_then(|tlc| tlc.attempt_id),
+            );
             return;
         };
+        debug!(
+            "handle_forward_tlc_result waiting task hit: channel={} payment_hash={:?} tlc_id={:?} add_tlc_result_ok={} waiting_len_before={} waiting_len_after={}",
+            state.get_id(),
+            result.payment_hash,
+            waiting_tlc_id,
+            add_tlc_result_ok,
+            waiting_len_before,
+            state.waiting_forward_tlc_tasks.len()
+        );
 
         match result.add_tlc_result {
             Ok((channel_id, tlc_id)) => {
@@ -3358,6 +3425,8 @@ impl Debug for TlcInfo {
             .field("status", &self.status)
             .field("amount", &self.amount)
             .field("total_amount", &self.total_amount)
+            .field("attempt_id", &self.attempt_id)
+            .field("forwarding_tlc", &self.forwarding_tlc)
             .field("removed_reason", &self.removed_reason)
             .field("payment_hash", &self.payment_hash)
             .field("removed_confirmed_at", &self.removed_confirmed_at)
@@ -3369,8 +3438,14 @@ impl Debug for TlcInfo {
 impl TlcInfo {
     pub fn log(&self) -> String {
         format!(
-            "id: {:?} status: {:?} amount: {:?} removed: {:?} hash: {:?} ",
-            &self.tlc_id, self.status, self.amount, self.removed_reason, self.payment_hash,
+            "id: {:?} status: {:?} amount: {:?} removed: {:?} hash: {:?} attempt_id: {:?} forwarding_tlc: {:?}",
+            &self.tlc_id,
+            self.status,
+            self.amount,
+            self.removed_reason,
+            self.payment_hash,
+            self.attempt_id,
+            self.forwarding_tlc,
         )
     }
 

@@ -10,8 +10,12 @@ use crate::fiber::config::{
 };
 use crate::fiber::features::FeatureVector;
 use crate::fiber::graph::ChannelInfo;
-use crate::fiber::network::{DebugEvent, FiberMessageWithPeerId, PeerDisconnectReason};
-use crate::fiber::payment::{AttemptStatus, PaymentStatus, SendPaymentCommand};
+use crate::fiber::network::{
+    BuildRouterCommand, DebugEvent, FiberMessageWithPeerId, HopRequire, PeerDisconnectReason,
+};
+use crate::fiber::payment::{
+    AttemptStatus, PaymentStatus, SendPaymentCommand, SendPaymentWithRouterCommand,
+};
 use crate::fiber::types::{
     AddTlc, FiberMessage, Hash256, Init, PaymentHopData, PeeledPaymentOnionPacket, Pubkey, TlcErr,
     TlcErrorCode, NO_SHARED_SECRET,
@@ -46,7 +50,7 @@ use musig2::secp::Point;
 use musig2::KeyAggContext;
 use ractor::call;
 use secp256k1::SECP256K1;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error};
 
@@ -6720,6 +6724,98 @@ async fn test_reestablish_commitment_number_consistency() {
     );
 }
 
+/// Regression for local-restart window:
+/// after local node restart, runtime outpoint map may be temporarily empty before channels
+/// are fully reestablished; this must be treated as retryable, not UnknownNextPeer.
+#[tokio::test]
+async fn test_local_restart_map_miss_is_retryable_not_unknown_next_peer() {
+    init_tracing();
+    let (mut node_a, node_b, _channel_id, _funding_tx) =
+        NetworkNode::new_2_nodes_with_established_channel(100000000000, 100000000000, true).await;
+
+    let router = node_a
+        .build_router(BuildRouterCommand {
+            amount: Some(1000),
+            udt_type_script: None,
+            hops_info: vec![HopRequire {
+                pubkey: node_b.pubkey,
+                channel_outpoint: None,
+            }],
+            final_tlc_expiry_delta: None,
+        })
+        .await
+        .expect("build router before restart");
+
+    node_a.restart().await;
+
+    // Router-specified payments do not auto-retry by design.
+    // Here we only verify restart-window classification is no longer UnknownNextPeer.
+    let mut router_payment_hashes = Vec::new();
+    for _ in 0..3 {
+        let res = node_a
+            .send_payment_with_router(SendPaymentWithRouterCommand {
+                router: router.router_hops.clone(),
+                keysend: Some(true),
+                ..Default::default()
+            })
+            .await;
+        match res {
+            Ok(res) => router_payment_hashes.push(res.payment_hash),
+            Err(err) => {
+                assert!(
+                    !err.contains("UnknownNextPeer"),
+                    "restart window should be retryable, got terminal UnknownNextPeer: {}",
+                    err
+                );
+            }
+        }
+    }
+    for payment_hash in router_payment_hashes {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            node_a.wait_until_final_status(payment_hash),
+        )
+        .await
+        .expect("router payment should reach final status");
+        let session = node_a
+            .get_payment_session(payment_hash)
+            .expect("router payment session should exist");
+        assert_ne!(
+            session.last_error_code,
+            Some(TlcErrorCode::UnknownNextPeer),
+            "router payment should not fail with UnknownNextPeer after restart"
+        );
+    }
+
+    // Keysend path should also avoid terminal UnknownNextPeer in restart window.
+    let keysend_res = node_a.send_payment_keysend(&node_b, 1001, false).await;
+    match keysend_res {
+        Err(err) => {
+            assert!(
+                !err.contains("UnknownNextPeer"),
+                "keysend should not fail terminally with UnknownNextPeer during restart: {}",
+                err
+            );
+        }
+        Ok(res) => {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                node_a.wait_until_final_status(res.payment_hash),
+            )
+            .await
+            .expect("keysend should reach final status after restart");
+            let session = node_a
+                .get_payment_session(res.payment_hash)
+                .expect("keysend payment session should exist");
+            assert_ne!(
+                session.last_error_code,
+                Some(TlcErrorCode::UnknownNextPeer),
+                "keysend should not be marked as UnknownNextPeer after restart"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_reestablish_dual_owed_ordering() {
     init_tracing();
@@ -6955,20 +7051,29 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
     // For self-payments the sender == receiver, so net balance across each node's
     // two channels should stay the same (minus routing fees paid to intermediaries).
     // Total across all channels should be strictly conserved.
-    let initial_total =
-        initial_a_ch0 + initial_a_ch3 +
-        initial_b_ch0 + initial_b_ch1 +
-        initial_c_ch1 + initial_c_ch2 +
-        initial_d_ch2 + initial_d_ch3;
+    let initial_total = initial_a_ch0
+        + initial_a_ch3
+        + initial_b_ch0
+        + initial_b_ch1
+        + initial_c_ch1
+        + initial_c_ch2
+        + initial_d_ch2
+        + initial_d_ch3;
 
     // Fire off 100 self-payments from each node (fire-and-forget, don't wait)
     let payment_amount = 1000; // small amount so routing has enough capacity
     let num_payments = 100u32;
 
-    debug!("=== Sending {} self-payments from each of 4 nodes ===", num_payments);
+    debug!(
+        "=== Sending {} self-payments from each of 4 nodes ===",
+        num_payments
+    );
     for i in 0..num_payments {
         send_seq += 1;
-        if let Ok(res) = node_a.send_payment_keysend_to_self(payment_amount, false).await {
+        if let Ok(res) = node_a
+            .send_payment_keysend_to_self(payment_amount, false)
+            .await
+        {
             send_traces.push(RingTlcTrace {
                 sender: "A",
                 sender_idx: 0,
@@ -6980,7 +7085,10 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
             });
         }
         send_seq += 1;
-        if let Ok(res) = node_b.send_payment_keysend_to_self(payment_amount, false).await {
+        if let Ok(res) = node_b
+            .send_payment_keysend_to_self(payment_amount, false)
+            .await
+        {
             send_traces.push(RingTlcTrace {
                 sender: "B",
                 sender_idx: 1,
@@ -6992,7 +7100,10 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
             });
         }
         send_seq += 1;
-        if let Ok(res) = node_c.send_payment_keysend_to_self(payment_amount, false).await {
+        if let Ok(res) = node_c
+            .send_payment_keysend_to_self(payment_amount, false)
+            .await
+        {
             send_traces.push(RingTlcTrace {
                 sender: "C",
                 sender_idx: 2,
@@ -7004,7 +7115,10 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
             });
         }
         send_seq += 1;
-        if let Ok(res) = node_d.send_payment_keysend_to_self(payment_amount, false).await {
+        if let Ok(res) = node_d
+            .send_payment_keysend_to_self(payment_amount, false)
+            .await
+        {
             send_traces.push(RingTlcTrace {
                 sender: "D",
                 sender_idx: 3,
@@ -7023,7 +7137,8 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
     {
         let source_nodes = [&node_a, &node_b, &node_c, &node_d];
         for trace in &mut send_traces {
-            if let Some(session) = source_nodes[trace.sender_idx].get_payment_session(trace.payment_hash)
+            if let Some(session) =
+                source_nodes[trace.sender_idx].get_payment_session(trace.payment_hash)
             {
                 trace.initial_status = session.status;
                 if let Some(attempt) = session.attempts().next() {
@@ -7062,12 +7177,18 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
     }
 
     // Check no unexpected events before restart
-    for (name, node) in [("A", &node_a), ("B", &node_b), ("C", &node_c), ("D", &node_d)] {
+    for (name, node) in [
+        ("A", &node_a),
+        ("B", &node_b),
+        ("C", &node_c),
+        ("D", &node_d),
+    ] {
         let events = node.get_triggered_unexpected_events().await;
         assert!(
             events.is_empty(),
             "node {} got unexpected events before restart: {:?}",
-            name, events
+            name,
+            events
         );
     }
 
@@ -7083,12 +7204,18 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
     tokio::time::sleep(Duration::from_secs(30)).await;
 
     // Verify: no unexpected events after restart
-    for (name, node) in [("A", &node_a), ("B", &node_b), ("C", &node_c), ("D", &node_d)] {
+    for (name, node) in [
+        ("A", &node_a),
+        ("B", &node_b),
+        ("C", &node_c),
+        ("D", &node_d),
+    ] {
         let events = node.get_triggered_unexpected_events().await;
         assert!(
             events.is_empty(),
             "node {} got unexpected events after restart: {:?}",
-            name, events
+            name,
+            events
         );
     }
 
@@ -7097,14 +7224,16 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
         let state = node_a.get_channel_actor_state(ch);
         assert!(
             !state.reestablishing,
-            "Node A channel {:?} still reestablishing", ch
+            "Node A channel {:?} still reestablishing",
+            ch
         );
     }
     for ch in [channels[2], channels[3]] {
         let state = node_d.get_channel_actor_state(ch);
         assert!(
             !state.reestablishing,
-            "Node D channel {:?} still reestablishing", ch
+            "Node D channel {:?} still reestablishing",
+            ch
         );
     }
 
@@ -7137,12 +7266,15 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
                     "source-unknown"
                 };
                 debug!(
-                    "residual tlc on node={} channel={:?} payment_hash={:?} tlc_id={:?} status={:?} source_session={}",
+                    "residual tlc on node={} channel={:?} payment_hash={:?} tlc_id={:?} status={:?} attempt_id={:?} forwarding_tlc={:?} removed_reason={:?} source_session={}",
                     name,
                     ch,
                     tlc.payment_hash,
                     tlc.tlc_id,
                     tlc.status,
+                    tlc.attempt_id,
+                    tlc.forwarding_tlc,
+                    tlc.removed_reason,
                     source
                 );
             }
@@ -7159,7 +7291,15 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
                 residual_by_hash
                     .entry(tlc.payment_hash)
                     .or_insert_with(Vec::new)
-                    .push((*name, *ch, tlc.tlc_id, tlc.status.clone()));
+                    .push((
+                        *name,
+                        *ch,
+                        tlc.tlc_id,
+                        tlc.status.clone(),
+                        tlc.forwarding_tlc,
+                        tlc.attempt_id,
+                        tlc.removed_reason.clone(),
+                    ));
             }
         }
     }
@@ -7204,24 +7344,63 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
         traces_with_no_residual,
         residual_without_trace
     );
+
+    // Trace-only diagnostics: map each residual TLC back to its original sender trace.
+    // This is used to locate which sender-side emissions contribute to stuck channels.
+    let mut stuck_sender_counts_by_channel: HashMap<Hash256, BTreeMap<&'static str, usize>> =
+        HashMap::new();
+    let mut stuck_samples_by_channel: HashMap<Hash256, Vec<String>> = HashMap::new();
+    for (payment_hash, entries) in &residual_by_hash {
+        let (sender, seq) = trace_by_hash
+            .get(payment_hash)
+            .map(|trace| (trace.sender, trace.seq))
+            .unwrap_or(("unknown", 0));
+        for (_node, channel_id, tlc_id, status, forwarding_tlc, attempt_id, removed_reason) in
+            entries
+        {
+            *stuck_sender_counts_by_channel
+                .entry(*channel_id)
+                .or_default()
+                .entry(sender)
+                .or_default() += 1;
+            let samples = stuck_samples_by_channel.entry(*channel_id).or_default();
+            if samples.len() < 12 {
+                samples.push(format!(
+                    "payment_hash={} sender={} seq={} tlc_id={:?} status={:?} forwarding_tlc={:?} attempt_id={:?} removed_reason={:?}",
+                    payment_hash, sender, seq, tlc_id, status, forwarding_tlc, attempt_id, removed_reason
+                ));
+            }
+        }
+    }
+    for (channel_id, sender_counts) in &stuck_sender_counts_by_channel {
+        debug!(
+            "stuck origin sender distribution: channel={:?} sender_counts={:?}",
+            channel_id, sender_counts
+        );
+        if let Some(samples) = stuck_samples_by_channel.get(channel_id) {
+            for sample in samples {
+                debug!(
+                    "stuck origin sample: channel={:?} {}",
+                    channel_id, sample
+                );
+            }
+        }
+    }
+
     let has_stuck_tlcs = !stuck_channels.is_empty();
     if has_stuck_tlcs {
-        error!(
-            "Stuck TLCs detected after restart: {:?}",
-            stuck_channels
-        );
+        error!("Stuck TLCs detected after restart: {:?}", stuck_channels);
     }
 
     // Verify: total balance across all channels is conserved
-    let final_total =
-        node_a.get_local_balance_from_channel(channels[0]) +
-        node_a.get_local_balance_from_channel(channels[3]) +
-        node_b.get_local_balance_from_channel(channels[0]) +
-        node_b.get_local_balance_from_channel(channels[1]) +
-        node_c.get_local_balance_from_channel(channels[1]) +
-        node_c.get_local_balance_from_channel(channels[2]) +
-        node_d.get_local_balance_from_channel(channels[2]) +
-        node_d.get_local_balance_from_channel(channels[3]);
+    let final_total = node_a.get_local_balance_from_channel(channels[0])
+        + node_a.get_local_balance_from_channel(channels[3])
+        + node_b.get_local_balance_from_channel(channels[0])
+        + node_b.get_local_balance_from_channel(channels[1])
+        + node_c.get_local_balance_from_channel(channels[1])
+        + node_c.get_local_balance_from_channel(channels[2])
+        + node_d.get_local_balance_from_channel(channels[2])
+        + node_d.get_local_balance_from_channel(channels[3]);
     assert_eq!(
         initial_total, final_total,
         "Total balance across all channels should be conserved.\n  initial: {}\n  final:   {}",
@@ -7254,7 +7433,10 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
         let session = session.expect("checked");
         let mut has_inflight = false;
         for attempt in session.attempts() {
-            if matches!(attempt.status, AttemptStatus::Inflight | AttemptStatus::Retrying) {
+            if matches!(
+                attempt.status,
+                AttemptStatus::Inflight | AttemptStatus::Retrying
+            ) {
                 has_inflight = true;
             }
         }
@@ -7276,10 +7458,10 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
                 .map(|entries| {
                     entries
                         .iter()
-                        .map(|(node, ch, id, status)| {
+                        .map(|(node, ch, id, status, forwarding_tlc, attempt_id, removed_reason)| {
                             format!(
-                                "node={} ch={:?} tlc_id={:?} status={:?}",
-                                node, ch, id, status
+                                "node={} ch={:?} tlc_id={:?} status={:?} forwarding_tlc={:?} attempt_id={:?} removed_reason={:?}",
+                                node, ch, id, status, forwarding_tlc, attempt_id, removed_reason
                             )
                         })
                         .collect::<Vec<_>>()
