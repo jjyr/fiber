@@ -2962,12 +2962,31 @@ where
                 channel.reestablishing = true;
                 channel.network = Some(self.network.clone());
                 channel.private_key = Some(args.private_key.clone());
+                channel.log_ack_state("[trace][reestablish] init_flag_set");
+                debug!(
+                    "[trace][reestablish] init_send channel={} local_peer={:?} remote_peer={:?} local_cn={} remote_cn={} waiting_ack={} send_present={} verify_present={} next_present={}",
+                    channel.get_id(),
+                    channel.get_local_peer_id(),
+                    channel.get_remote_peer_id(),
+                    channel.get_local_commitment_number(),
+                    channel.get_remote_commitment_number(),
+                    channel.tlc_state.waiting_ack,
+                    channel.remote_revocation_nonce_for_send.is_some(),
+                    channel.remote_revocation_nonce_for_verify.is_some(),
+                    channel.remote_revocation_nonce_for_next.is_some(),
+                );
 
                 let reestablish_channel = ReestablishChannel {
                     channel_id,
                     local_commitment_number: channel.get_local_commitment_number(),
                     remote_commitment_number: channel.get_remote_commitment_number(),
                 };
+                debug!(
+                    "[trace][reestablish] enqueue network send channel={} local_cn={} remote_cn={}",
+                    channel_id,
+                    reestablish_channel.local_commitment_number,
+                    reestablish_channel.remote_commitment_number
+                );
 
                 self.network
                     .send_message(NetworkActorMessage::new_command(
@@ -2977,6 +2996,11 @@ where
                         )),
                     ))
                     .expect(ASSUME_NETWORK_ACTOR_ALIVE);
+                debug!(
+                    "[trace][reestablish] enqueued network send channel={} remote_peer={:?}",
+                    channel_id,
+                    self.get_remote_peer_id()
+                );
 
                 channel
             }
@@ -5927,8 +5951,9 @@ impl ChannelActorState {
             // update balance according to the tlc,
             // we already checked the amount is valid in handle_add_tlc_command and handle_add_tlc_peer_message
             // here we double confirm everything is correct with `checked_*` methods
-            let (mut to_local_amount, mut to_remote_amount) =
-                (self.to_local_amount, self.to_remote_amount);
+            let old_local_amount = self.to_local_amount;
+            let old_remote_amount = self.to_remote_amount;
+            let (mut to_local_amount, mut to_remote_amount) = (old_local_amount, old_remote_amount);
             if current.is_offered() {
                 to_local_amount = to_local_amount.checked_sub(current.amount).ok_or(
                     ProcessingChannelError::InternalError(format!(
@@ -5960,8 +5985,20 @@ impl ChannelActorState {
             self.to_local_amount = to_local_amount;
             self.to_remote_amount = to_remote_amount;
 
-            debug!("Updated local balance to {} and remote balance to {} by removing tlc {:?} with reason {:?}",
-                            to_local_amount, to_remote_amount, tlc_id, reason);
+            debug!(
+                "[trace][balance] remove_fulfill_apply channel={} payment_hash={} tlc_id={:?} status={:?} amount={} old_local={} old_remote={} new_local={} new_remote={} waiting_ack={} reestablishing={}",
+                self.get_id(),
+                current.payment_hash,
+                tlc_id,
+                current.status,
+                current.amount,
+                old_local_amount,
+                old_remote_amount,
+                to_local_amount,
+                to_remote_amount,
+                self.tlc_state.waiting_ack,
+                self.reestablishing
+            );
             self.apply_remove_tlc(tlc_id);
         }
         debug!(
@@ -7178,8 +7215,24 @@ impl ChannelActorState {
         let Some(outpoint) = self.get_funding_transaction_outpoint() else {
             return;
         };
+        debug!(
+            "[trace][reestablish] clear_flag start channel={} waiting_ack={} send_present={} verify_present={} next_present={} reestablishing={}",
+            self.get_id(),
+            self.tlc_state.waiting_ack,
+            self.remote_revocation_nonce_for_send.is_some(),
+            self.remote_revocation_nonce_for_verify.is_some(),
+            self.remote_revocation_nonce_for_next.is_some(),
+            self.reestablishing,
+        );
 
         self.reestablishing = false;
+        self.log_ack_state("[trace][reestablish] clear_flag_done");
+        debug!(
+            "[trace][reestablish] schedule channel_ready_event channel={} peer={:?} delay_ms={}",
+            self.get_id(),
+            self.get_remote_peer_id(),
+            WAITING_REESTABLISH_FINISH_TIMEOUT.as_millis()
+        );
 
         // If the channel is already ready, we should notify the network actor.
         // so that we update the network.outpoint_channel_map
@@ -7442,6 +7495,7 @@ impl ChannelActorState {
         reestablish_channel: &ReestablishChannel,
         pending_commit_diff: Option<CommitDiff>,
     ) -> ProcessingChannelResult {
+        self.log_ack_state("[trace][reestablish] handle_enter");
         debug!(
             "peer: {:?} Handling reestablish channel message: {:?}, our commitment_numbers {:?} in channel state {:?}, has_commit_diff: {}",
             self.get_local_peer_id(),

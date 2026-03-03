@@ -186,3 +186,250 @@ Not a single sender bug. It is a channel bottleneck effect:
   - first stuck wave per channel
   - corresponding sender/seq/payment_hash tuple
   - channel recovery state around that exact window
+
+---
+
+## Update (2026-03-02): Root Cause Refinement for `7f90...` (No Fix)
+
+### New deterministic chain (from code + logs)
+
+1) Reconnect is effectively one-shot in this test window
+
+- `MAINTAINING_CONNECTIONS_INTERVAL` is `1200s` (`crates/fiber-lib/src/fiber/network.rs`).
+- `MaintainConnections` is triggered once at actor startup, then every 20 minutes.
+- In this full failing run, `"Trying to connect to peers with mutual channels"` appears only 6 times total:
+  - 4 initial node boots
+  - 2 restart boots
+  - no extra reconnect tick inside the ~300s test runtime
+
+2) `7f90...` only got startup-time reconnect attempts, both with stale pre-restart addresses
+
+- Node A startup-side attempt:
+  - `2026-03-02T09:13:15.229759Z`
+  - `Reconnecting channel 7f90... peers QmWYo... with addresses {51758,51759}`
+- Node D startup-side attempt:
+  - `2026-03-02T09:13:20.086516Z`
+  - `Reconnecting channel 7f90... peers Qme5... with addresses {51748,51749}`
+- Corresponding dial errors:
+  - `2026-03-02T09:13:16.060324Z` dial `51758` failed (`ConnectionReset`)
+  - `2026-03-02T09:13:20.673959Z` dial `51748` failed (`ConnectionRefused`)
+
+3) Fresh addresses exist later, but no second reconnect window
+
+- Node-0 restarted with new addr `52155/52156` at `2026-03-02T09:13:15.227978Z`.
+- Node-3 restarted with new addr `52164/52165` at `2026-03-02T09:13:20.084557Z`.
+- New node announcements are observed in logs (including later processing of node-0 new `52155/52156`), but `7f90...` has no further reconnect attempt lines after the two startup attempts.
+
+4) Therefore `7f90...` never reestablishes in this run
+
+- No `trying to reestablish channel 7f90...`
+- No `reestablish_channel request ... channel=7f90...`
+- No `channel 7f90... reestablished successfully`
+- Meanwhile other channels (`f75...`, `9332...`) do show full reestablish success logs.
+
+5) Missing-actor remove storm is downstream, not first cause
+
+- `send_command_to_channel no running channel actor for 7f90...` and `missing-actor remove context ...` continue after the missed reconnect window.
+- These residual removes then propagate through adjacent channels and become large-scale stuck TLCs.
+
+### Code-level supporting gap
+
+- `ServiceHandle::handle_error` only logs `DialerError` and has a TODO:
+  - `ServiceError::DialerError => remove address from peer store`
+- There is currently no immediate retry or retry scheduling on dial failure in this path.
+
+### Current status
+
+- This update is localization-only.
+- No behavior fix is applied in this round.
+
+---
+
+## Update (2026-03-02): Trace Round for Exact Imbalance Source (No Fix)
+
+### What was added (trace-only)
+
+- `crates/fiber-lib/src/fiber/channel.rs`
+  - Added `[trace][balance] remove_fulfill_apply ...` in `remove_tlc_with_reason`:
+    - channel id
+    - payment hash
+    - tlc id/status
+    - amount
+    - old/new local+remote balances
+    - waiting_ack / reestablishing flags
+- `crates/fiber-lib/src/fiber/tests/channel.rs`
+  - Added `[trace][balance]` summaries before total assertion:
+    - final endpoint balances for A/B/C/D
+    - per-channel pair sum `initial => final` for AB/BC/CD/DA
+
+### Repro run
+
+- Command:
+  - `RUST_LOG=debug cargo nextest run -p fnn test_ring_self_payments_then_restart_two_nodes --run-ignored ignored-only --nocapture`
+- Log:
+  - `/tmp/tlc_stuck_retrace_round2.log`
+- Result:
+  - failed with balance drift
+  - `initial: 800000000000000`
+  - `final:   800000000001001`
+
+### Deterministic localization result
+
+1) Imbalance is isolated to the `C-D` channel pair
+
+- `[trace][balance] per_channel_pair_sum ... CD=200000000000000=>200000000001001`
+- AB/BC/DA remained conserved in this run.
+
+2) Concrete first imbalance sample
+
+- Channel: `0xae5e...` (C-D side in this run)
+- Payment hash: `0xce6daa2b...9b3885`
+- Observed apply:
+  - `[trace][balance] remove_fulfill_apply ... channel=0xae5e... payment_hash=0xce6d... tlc_id=Received(24) amount=1001 ...`
+- Missing counterpart on same channel:
+  - no corresponding `tlc_id=Offered(24)` apply for the same hash on `0xae5e...`
+- Residual confirms one-sided stuck:
+  - node D on `0xae5e...` has `payment_hash=0xce6d...`, `tlc_id=Offered(24)`, `status=Outbound(RemoveWaitAck)`, `removed_reason=RemoveTlcFulfill`
+
+3) Upstream remove dispatch for this same hash is repeatedly blocked by missing actor
+
+- On channel `0x624a...`:
+  - repeated logs:
+    - `send_command_to_channel missing-actor remove context: ... payment_hash=0xce6d... tlc_id=Received(11) reason=RemoveTlcFulfill ... tlc_status=Inbound(Committed) ... forwarding_tlc=(0xae5e..., 24)`
+  - duplicate retryable removes are ignored while actor is missing:
+    - `duplicate retryable remove ignored for missing actor`
+
+4) This run's missing-actor remove is large-scale, not a one-off
+
+- Total `missing-actor remove context` lines: `405`
+- Distribution by channel:
+  - `0x624a...`: `206`
+  - `0xae5e...`: `181`
+  - `0x362e...`: `18`
+
+### Current conclusion
+
+- In this run, the first deterministic break is not `reestablish` send/recv delivery.
+- The deterministic break is **remove path dispatch hitting missing channel actor**, then accumulating retry queue + residual TLCs.
+- Balance drift is a downstream consequence of one-sided fulfill progression after these missing-actor remove breaks.
+
+---
+
+## Update (2026-03-02): Actor Map / Retry Replay Trace Round (No Fix)
+
+### Added trace (this round)
+
+- `crates/fiber-lib/src/fiber/network.rs`
+  - `[trace][actor_map] on_channel_created start/inserted/skipped_insert_no_session`
+  - `[trace][actor_map] channel_actor_stopped start/done`
+  - extended `missing-actor remove context` with:
+    - `remote_peer`
+    - `peer_connected`
+    - `peer_session`
+    - `session_contains_channel`
+    - `running_channels`
+    - `session_map_entries`
+    - `outpoint_mapped`
+    - `pending_outpoint_mapped`
+
+### Repro run
+
+- Command:
+  - `RUST_LOG=debug cargo nextest run -p fnn test_ring_self_payments_then_restart_two_nodes --run-ignored ignored-only --nocapture`
+- Log:
+  - `/tmp/tlc_stuck_retrace_round3.log`
+- Result:
+  - still failed by stuck TLC assertion
+  - **no balance drift in this run**:
+    - `AB/BC/CD/DA` all conserved (`initial == final`)
+
+### Deterministic observations
+
+1) `missing-actor remove` happens during disconnected window (not fake map state)
+
+- Repeated lines show:
+  - `peer_connected=false`
+  - `peer_session=None`
+  - `session_contains_channel=None`
+  - `outpoint_mapped=false`
+- Example channel ids in this run:
+  - `b874...`
+  - `e43d...`
+
+2) `on_channel_created skipped_insert_no_session` is **not** observed
+
+- All observed `on_channel_created` in this run have `session=Some(...)` and go through `inserted`.
+- So this round did not reproduce a direct "spawned but not inserted because no session" branch.
+
+3) `b874...` path: actor is eventually reestablished, but replay drain is too slow before test ends
+
+- `missing-actor` storm happens first.
+- Later `on_channel_created ... inserted` appears for `b874...` again.
+- Then `reestablish ready branch exit` shows large backlog:
+  - e.g. `retryable_ops=25`
+- `apply_retryable_tlc_operations` for `b874...` repeatedly logs:
+  - `blocked ... waiting_tlc_ack=true`
+  - occasional `pop op` / `op succeeded`, then back to blocked
+- Near test end it still has large remaining queue (e.g. `remained_ops=24`), so residual TLC assertion still fails.
+
+### Current conclusion (this round)
+
+- In this round, the key failure is **not** "reestablish did not happen".
+- Reestablish eventually happens for the missing channel actor.
+- The stuck outcome is from **long disconnected missing-actor window + large retryable queue + ack-gated replay progress**, which is not drained before assertion time.
+- Therefore this run localizes to replay throughput/ordering under backlog, rather than map insertion failure semantics.
+
+---
+
+## Update (2026-03-03): Increase Test Wait Window to 120s and Reobserve
+
+### Change
+
+- Test `test_ring_self_payments_then_restart_two_nodes`:
+  - `Wait for reestablish and TLC settlement` changed from `30s` to `120s`.
+  - file: `crates/fiber-lib/src/fiber/tests/channel.rs`
+
+### Repro result
+
+- Command:
+  - `RUST_LOG=debug cargo nextest run -p fnn test_ring_self_payments_then_restart_two_nodes --run-ignored ignored-only --nocapture`
+- Log:
+  - `/tmp/tlc_stuck_retrace_round4_wait120.log`
+- Result:
+  - `PASS` (`1 passed`)
+  - balance conserved:
+    - `AB/BC/CD/DA` all `initial == final`
+  - no `Node still has stuck TLCs after restart`
+
+### How logs represent real replay window and blocked time
+
+- Real missing-actor window:
+  - from first to last `missing-actor remove context` for the same channel id
+- Actor rejoin point:
+  - first `[trace][actor_map] on_channel_created inserted channel=...` after missing start
+- Replay start:
+  - first `apply_retryable_tlc_operations pop op` after actor rejoin
+- Replay blocked time:
+  - sum of durations from each `... blocked ...` to the next `... pop op ...` (same channel)
+
+### Quantified comparison (30s vs 120s)
+
+- 30s run (`/tmp/tlc_stuck_retrace_round3.log`, representative channel `b874...`):
+  - missing window: `~24.98s`
+  - rejoin after missing start: `~26.71s`
+  - replay pops after rejoin before assert: `3`
+  - last pop to assertion: `~0.56s`
+  - outcome: stuck assertion failed
+
+- 120s run (`/tmp/tlc_stuck_retrace_round4_wait120.log`, representative channel `8e49...`):
+  - missing window: `~29.38s`
+  - rejoin after missing start: `~29.66s`
+  - replay pops after rejoin before assert: `63`
+  - last pop to assertion: `~35.63s`
+  - outcome: pass
+
+### Conclusion
+
+- Enlarging wait window alone can make this test pass consistently in at least this run.
+- This confirms "window too short" is a real contributor.
+- Replay remains ack-gated and can spend long time blocked under backlog; efficiency is still a separate optimization topic.

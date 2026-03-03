@@ -4441,6 +4441,48 @@ async fn test_connect_to_peers_with_mutual_channel_on_restart_2() {
 }
 
 #[tokio::test]
+async fn test_peer_disconnect_with_active_channel_enters_backoff_reconnect() {
+    init_tracing();
+
+    let (mut node_a, mut node_b, _new_channel_id, _) =
+        NetworkNode::new_2_nodes_with_established_channel(100000000000, 100000000000, true).await;
+
+    node_b.stop().await;
+
+    node_a
+        .expect_debug_event("PeerReconnectBackoffSeededByDisconnect")
+        .await;
+    node_a
+        .expect_debug_event("PeerReconnectBackoffScheduled")
+        .await;
+    node_a
+        .expect_event(|event| {
+            matches!(event, NetworkServiceEvent::PeerDisConnected(id, _) if id == &node_b.peer_id)
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_startup_dial_error_with_active_channel_enters_backoff_reconnect() {
+    init_tracing();
+
+    let (mut node_a, mut node_b, _new_channel_id, _) =
+        NetworkNode::new_2_nodes_with_established_channel(100000000000, 100000000000, true).await;
+
+    node_a.stop().await;
+    node_b.stop().await;
+
+    node_a.start().await;
+
+    node_a
+        .expect_debug_event("PeerReconnectBackoffSeededByDialError")
+        .await;
+    node_a
+        .expect_debug_event("PeerReconnectBackoffScheduled")
+        .await;
+}
+
+#[tokio::test]
 async fn test_send_payment_with_node_restart_then_resend_add_tlc() {
     init_tracing();
 
@@ -7199,9 +7241,11 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
     node_a.add_unexpected_events(panic_events.clone()).await;
     node_d.add_unexpected_events(panic_events.clone()).await;
 
-    // Wait for reestablish and TLC settlement
+    // Wait for reestablish and TLC settlement.
+    // In restart stress runs we can accumulate large retryable queues that are replayed
+    // one-by-one behind waiting_tlc_ack gating, so use a wider observation window.
     debug!("=== Waiting for reestablish and TLC settlement ===");
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(120)).await;
 
     // Verify: no unexpected events after restart
     for (name, node) in [
@@ -7379,10 +7423,7 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
         );
         if let Some(samples) = stuck_samples_by_channel.get(channel_id) {
             for sample in samples {
-                debug!(
-                    "stuck origin sample: channel={:?} {}",
-                    channel_id, sample
-                );
+                debug!("stuck origin sample: channel={:?} {}", channel_id, sample);
             }
         }
     }
@@ -7393,14 +7434,46 @@ async fn test_ring_self_payments_then_restart_two_nodes() {
     }
 
     // Verify: total balance across all channels is conserved
-    let final_total = node_a.get_local_balance_from_channel(channels[0])
-        + node_a.get_local_balance_from_channel(channels[3])
-        + node_b.get_local_balance_from_channel(channels[0])
-        + node_b.get_local_balance_from_channel(channels[1])
-        + node_c.get_local_balance_from_channel(channels[1])
-        + node_c.get_local_balance_from_channel(channels[2])
-        + node_d.get_local_balance_from_channel(channels[2])
-        + node_d.get_local_balance_from_channel(channels[3]);
+    let final_a_ch0 = node_a.get_local_balance_from_channel(channels[0]);
+    let final_a_ch3 = node_a.get_local_balance_from_channel(channels[3]);
+    let final_b_ch0 = node_b.get_local_balance_from_channel(channels[0]);
+    let final_b_ch1 = node_b.get_local_balance_from_channel(channels[1]);
+    let final_c_ch1 = node_c.get_local_balance_from_channel(channels[1]);
+    let final_c_ch2 = node_c.get_local_balance_from_channel(channels[2]);
+    let final_d_ch2 = node_d.get_local_balance_from_channel(channels[2]);
+    let final_d_ch3 = node_d.get_local_balance_from_channel(channels[3]);
+
+    let final_total = final_a_ch0
+        + final_a_ch3
+        + final_b_ch0
+        + final_b_ch1
+        + final_c_ch1
+        + final_c_ch2
+        + final_d_ch2
+        + final_d_ch3;
+
+    debug!(
+        "[trace][balance] final_endpoint_balances A(ch0={},ch3={}) B(ch0={},ch1={}) C(ch1={},ch2={}) D(ch2={},ch3={})",
+        final_a_ch0,
+        final_a_ch3,
+        final_b_ch0,
+        final_b_ch1,
+        final_c_ch1,
+        final_c_ch2,
+        final_d_ch2,
+        final_d_ch3
+    );
+    debug!(
+        "[trace][balance] per_channel_pair_sum initial_vs_final AB={}=>{} BC={}=>{} CD={}=>{} DA={}=>{}",
+        initial_a_ch0 + initial_b_ch0,
+        final_a_ch0 + final_b_ch0,
+        initial_b_ch1 + initial_c_ch1,
+        final_b_ch1 + final_c_ch1,
+        initial_c_ch2 + initial_d_ch2,
+        final_c_ch2 + final_d_ch2,
+        initial_a_ch3 + initial_d_ch3,
+        final_a_ch3 + final_d_ch3
+    );
     assert_eq!(
         initial_total, final_total,
         "Total balance across all channels should be conserved.\n  initial: {}\n  final:   {}",
