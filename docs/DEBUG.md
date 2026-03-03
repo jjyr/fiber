@@ -433,3 +433,58 @@ Not a single sender bug. It is a channel bottleneck effect:
 - Enlarging wait window alone can make this test pass consistently in at least this run.
 - This confirms "window too short" is a real contributor.
 - Replay remains ack-gated and can spend long time blocked under backlog; efficiency is still a separate optimization topic.
+
+---
+
+## Update (2026-03-03): Why `waiting_ack` Is Long (Layered Attribution, No Fix)
+
+### Scope
+
+- This round only localizes the reason for long `waiting_ack`.
+- No behavior fix is applied in this update.
+
+### Target sample (longest observed window in this run)
+
+- Channel: `8e497f6606aa93307994062969d3a0b1507996d5a1140826e83df8879e0a064c`
+- Log: `/tmp/tlc_stuck_retrace_round4_wait120.log`
+- Long window:
+  - `set_waiting_ack(true)` at `2026-03-03T03:38:58.538696Z`
+  - `set_waiting_ack(false)` at `2026-03-03T03:39:31.628878Z`
+  - duration: `33.090s`
+
+### Layered timeline for this window
+
+1) Channel/peer dropped first (actor not alive)
+
+- `ChannelActor stopped ... reason: PeerDisConnected` appears for `8e49...` at:
+  - `2026-03-03T03:39:00.022181Z`
+- Network actor map cleanup confirms actor removed and outpoint mapping cleared:
+  - `channel_actor_stopped ... outpoint_mapped_after=false`
+
+2) Reconnect phase dominates elapsed time
+
+- During the long window, repeated dial failures occur:
+  - `DialerError ... ConnectionRefused` (multiple times)
+  - `Handshake ... ConnectionReset` (for peer side)
+- Representative failure sequence (same restart window) shows widening gaps:
+  - `03:39:05.079` -> `03:39:07.390` (`+2.31s`)
+  - `03:39:07.390` -> `03:39:10.165` (`+2.77s`)
+  - `03:39:10.269` -> `03:39:15.535` (`+5.27s`)
+  - `03:39:18.702` -> `03:39:30.541` (`+11.84s`)
+- This is consistent with backoff-governed reconnect delay being the major contributor before reestablish can start.
+
+3) Reestablish itself is comparatively short
+
+- Reestablish for `8e49...` starts around:
+  - `init_flag_set`: `2026-03-03T03:39:30.134724Z`
+  - `handle_enter`: `2026-03-03T03:39:30.925260Z`
+  - final `set_waiting_ack(false)`: `2026-03-03T03:39:31.628878Z`
+- Phase split for this single window:
+  - `waiting_ack(true) -> init_flag_set`: `~31.596s`
+  - `init_flag_set -> waiting_ack(false)`: `~1.494s`
+
+### Deterministic conclusion
+
+- In this sample, long `waiting_ack` is primarily **reconnect-not-ready time** (peer offline/backoff/dial failures), not slow channel reestablish logic.
+- Once reestablish enters message exchange, `waiting_ack` clears quickly (order of ~1-2s in this run).
+- Therefore, the first layer to optimize/verify is reconnect availability and retry/backoff behavior, not `waiting_ack` state semantics.
