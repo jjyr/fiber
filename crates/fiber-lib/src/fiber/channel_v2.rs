@@ -5842,6 +5842,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v2_expiry_fail_cannot_supersede_queued_fulfill() {
+        let (mut a, mut b, id) =
+            create_nodes_with_established_channel(100000000000, 11800000000, false).await;
+        let preimage = crate::gen_rand_sha256_hash();
+        let invoice = crate::invoice::InvoiceBuilder::new(crate::invoice::Currency::Fibd)
+            .amount(Some(1000))
+            .payment_preimage(preimage)
+            .payee_pub_key(b.pubkey.into())
+            .expiry_time(std::time::Duration::from_secs(3600))
+            .build_with_sign(|hash| {
+                secp256k1::SECP256K1.sign_ecdsa_recoverable(hash, &b.private_key.0)
+            })
+            .unwrap();
+        let hash = *invoice.payment_hash();
+        b.insert_invoice(invoice.clone(), None);
+        a.send_payment(crate::fiber::payment::SendPaymentCommand {
+            invoice: Some(invoice.to_string()),
+            max_parts: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        crate::tests::test_utils::wait_until_timeout(10000, || {
+            !b.store.get_payment_hold_tlcs(hash).is_empty()
+        })
+        .await;
+        let forwarder = b.get_channel_actor_state(id);
+        let received = forwarder
+            .tlc_state
+            .received_tlcs
+            .tlcs
+            .iter()
+            .find(|tlc| tlc.payment_hash == hash)
+            .unwrap();
+        assert_eq!(
+            received.inbound_status(),
+            fiber_types::InboundTlcStatus::Committed
+        );
+        let tlc_id = received.id();
+        b.stop().await;
+        a.stop().await;
+
+        for rpc in [false, true] {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let (network, task) = Actor::spawn(None, CaptureNetwork, captured.clone())
+                .await
+                .unwrap();
+            let (myself, handle) = Actor::spawn(None, NoopChannelActor, ()).await.unwrap();
+            let actor =
+                ChannelActor::new(b.pubkey, a.pubkey, network.clone(), MockStore::new(), None);
+            let mut state = forwarder.clone();
+            state.network = Some(network.clone());
+            assert!(!state.reestablishing);
+            assert!(!state.tlc_state.waiting_ack);
+            let tlc_id = fiber_types::TLCId::Received(tlc_id);
+            let fulfill =
+                fiber_types::RemoveTlcReason::RemoveTlcFulfill(fiber_types::RemoveTlcFulfill {
+                    payment_preimage: preimage,
+                });
+            state.retryable_tlc_operations.push_back(
+                fiber_types::RetryableTlcOperation::RemoveTlc(tlc_id, fulfill.clone()),
+            );
+            let now = crate::now_timestamp_as_millis_u64();
+            state.tlc_state.get_mut(&tlc_id).unwrap().expiry = now + 1000;
+            // A delayed expiry command may already be in the mailbox before this close.
+            actor.maintain_ready_channel_tlcs(&myself, &mut state).await;
+            assert!(actor
+                .maintain_expiring_received_tlcs(&myself, &mut state, now)
+                .await
+                .unwrap());
+            let command = RemoveTlcCommand {
+                id: u64::from(tlc_id),
+                reason: fiber_types::RemoveTlcReason::RemoveTlcFail(
+                    fiber_types::TlcErrPacket::new(
+                        fiber_types::TlcErr::new(fiber_types::TlcErrorCode::ExpiryTooSoon),
+                        &state.tlc_state.get(&tlc_id).unwrap().shared_secret,
+                    ),
+                ),
+            };
+            // Older persisted queues may contain a failure ahead of the authorized fulfill.
+            state
+                .retryable_tlc_operations
+                .push_front(RetryableTlcOperation::RemoveTlc(
+                    tlc_id,
+                    command.reason.clone(),
+                ));
+            let result = if rpc {
+                let (reply, response) = tokio::sync::oneshot::channel();
+                let result = actor
+                    .handle_command(
+                        &myself,
+                        &mut state,
+                        super::super::ChannelCommand::RemoveTlc(command, reply.into()),
+                    )
+                    .await;
+                assert!(response.await.unwrap().is_err());
+                result
+            } else {
+                actor
+                    .handle_remove_tlc_command(&myself, &mut state, command)
+                    .await
+            };
+            assert!(
+                matches!(
+                    result,
+                    Err(super::super::ProcessingChannelError::RepeatedProcessing(_))
+                ),
+                "an expiry failure must not supersede an authorized queued fulfill: {result:?}"
+            );
+            assert!(state
+                .tlc_state
+                .get(&tlc_id)
+                .unwrap()
+                .removed_reason
+                .is_none());
+            actor
+                .handle_remove_tlc_command(
+                    &myself,
+                    &mut state,
+                    RemoveTlcCommand {
+                        id: u64::from(tlc_id),
+                        reason: fulfill,
+                    },
+                )
+                .await
+                .unwrap();
+            actor.persist_state_and_publish_pending_effects(&mut state);
+            capture_barrier(&network, id).await;
+            let wire = take_wire_messages(&captured);
+            assert_eq!(wire.len(), 1);
+            assert!(matches!(&wire[0].message,
+                FiberMessage::ChannelNormalOperation(FiberChannelMessage::RemoveTlc(remove))
+                    if matches!(remove.reason, fiber_types::RemoveTlcReason::RemoveTlcFulfill(_))));
+            let durable = actor.store.get_channel_actor_state(&id).unwrap();
+            assert!(matches!(
+                durable.tlc_state.get(&tlc_id).unwrap().removed_reason,
+                Some(fiber_types::RemoveTlcReason::RemoveTlcFulfill(_))
+            ));
+            myself.stop(None);
+            handle.await.unwrap();
+            network.stop(None);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_v2_force_closing_removal_is_committed_and_published_without_cs() {
         let (mut a, mut b, id) =
             create_nodes_with_established_channel(100000000000, 11800000000, false).await;
@@ -7369,6 +7515,16 @@ mod tests {
         )
         .await;
         b.wait_for_held_fiber_messages(2).await;
+        // B holding ClosingSigned only proves its own shutdown was sent. A's
+        // network/channel actors can still be processing that Shutdown message.
+        crate::tests::test_utils::wait_until_timeout(5_000, || {
+            a.get_channel_actor_state(id)
+                .session_v2
+                .as_ref()
+                .and_then(|session| session.closing.as_ref())
+                .is_some_and(|close| close.remote_shutdown.is_some())
+        })
+        .await;
         let mut retained = a.get_channel_actor_state(id);
         let close = retained
             .session_v2
